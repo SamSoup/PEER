@@ -12,9 +12,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from modelsv2.data import build_raw_dataloaders, build_cache_loader, prepare_prompts
-from modelsv2.llama_backbone import FrozenLlama
-from modelsv2.modules import PerceiverCompressor, SlotSelector, KeyReadout
+from peer.data import build_raw_dataloaders, build_cache_loader, prepare_prompts
+from peer.llama_backbone import FrozenLlama
+from peer.modules import PerceiverCompressor, SlotSelector, KeyReadout
 
 
 def hash_state_dict(state_dict):

@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
 
 from data.factory import get_datamodule
-from modelsv2.prompting import build_prompts
+from peer.prompting import build_prompts
 
 
 def _resolve_val_split(dm):

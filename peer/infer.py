@@ -11,14 +11,14 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from modelsv2.data import (
+from peer.data import (
     build_raw_dataloaders,
     build_test_loader,
     prepare_prompts,
 )
-from modelsv2.llama_backbone import FrozenLlama
-from modelsv2.modules import InferenceHead, PerceiverCompressor, ScalarLabelEmbedder
-from modelsv2.utils import regression_metrics
+from peer.llama_backbone import FrozenLlama
+from peer.modules import InferenceHead, PerceiverCompressor, ScalarLabelEmbedder
+from peer.utils import regression_metrics
 
 
 def load_stage_b_modules(ckpt, device):
@@ -45,7 +45,9 @@ def main():
         description="Inference over test split with fixed prototypes."
     )
     parser.add_argument("--model_name", required=True, help="HF LLaMA name.")
-    parser.add_argument("--dataset", required=True, help="Dataset name for prompt selection.")
+    parser.add_argument(
+        "--dataset", required=True, help="Dataset name for prompt selection."
+    )
     parser.add_argument(
         "--cache_dir", default="cache", help="Directory with cache tensors."
     )
@@ -53,7 +55,9 @@ def main():
         "--ckpt", default="stageC.pt", help="Path to Stage B/C checkpoint."
     )
     parser.add_argument(
-        "--prototypes", default="prototypes.pt", help="Prototype indices tensor."
+        "--prototypes",
+        default="prototypes.pt",
+        help="Prototype indices tensor.",
     )
     parser.add_argument(
         "--max_length",
@@ -93,9 +97,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    Wq, QueryComp, LabelEmb, Inference, d_h = load_stage_b_modules(
-        ckpt, device
-    )
+    Wq, QueryComp, LabelEmb, Inference, d_h = load_stage_b_modules(ckpt, device)
     Wq.eval(), QueryComp.eval(), LabelEmb.eval(), Inference.eval()
     torch.set_grad_enabled(False)
     standardize = bool(ckpt.get("standardize_labels", True))
@@ -187,9 +189,7 @@ def main():
 
     # Explanations: sample 5 random test examples
     test_ds = dm.dataset["test"]
-    sample_idxs = random.sample(
-        range(len(test_ds)), k=min(5, len(test_ds))
-    )
+    sample_idxs = random.sample(range(len(test_ds)), k=min(5, len(test_ds)))
     explanations = []
     for idx_ds in sample_idxs:
         row = test_ds[idx_ds]

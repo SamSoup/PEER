@@ -12,14 +12,14 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from modelsv2.data import build_raw_dataloaders, prepare_prompts
-from modelsv2.llama_backbone import FrozenLlama
-from modelsv2.modules import (
+from peer.data import build_raw_dataloaders, prepare_prompts
+from peer.llama_backbone import FrozenLlama
+from peer.modules import (
     InferenceHead,
     PerceiverCompressor,
     ScalarLabelEmbedder,
 )
-from modelsv2.utils import huber_loss, regression_metrics
+from peer.utils import huber_loss, regression_metrics
 
 
 def set_seed(seed: int):
@@ -331,7 +331,10 @@ def main():
                         current_score = val_metrics.get(best_metric_name)
 
                     better = False
-                    if current_score is not None and current_score == current_score:
+                    if (
+                        current_score is not None
+                        and current_score == current_score
+                    ):
                         if minimize:
                             better = current_score < best_score
                         else:
@@ -393,12 +396,12 @@ def main():
             "m": m,
             "standardize_labels": args.standardize_labels,
             "best_metric": best_metric_name,
-            "best_score": best_score
-            if best_score
-            not in (
-                float("inf") if minimize else -float("inf")
-            )
-            else None,
+            "best_score": (
+                best_score
+                if best_score
+                not in (float("inf") if minimize else -float("inf"))
+                else None
+            ),
             "best_epoch": best_epoch if best_epoch >= 0 else None,
             "best_val_metrics": best_val_metrics,
         }

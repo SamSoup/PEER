@@ -12,15 +12,15 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from modelsv2.data import build_raw_dataloaders, prepare_prompts
-from modelsv2.llama_backbone import FrozenLlama
-from modelsv2.modules import (
+from peer.data import build_raw_dataloaders, prepare_prompts
+from peer.llama_backbone import FrozenLlama
+from peer.modules import (
     InferenceHead,
     PerceiverCompressor,
     ScalarLabelEmbedder,
     KeyReadout,
 )
-from modelsv2.utils import (
+from peer.utils import (
     huber_loss,
     regression_metrics,
     set_label_stats_from_loader,
@@ -277,7 +277,9 @@ def train_stage_a(
                     current_score = metrics.get(best_metric_name)
 
                 better = False
-                if current_score is not None and current_score == current_score:  # not NaN
+                if (
+                    current_score is not None and current_score == current_score
+                ):  # not NaN
                     if minimize:
                         better = current_score < best_score
                     else:
@@ -352,7 +354,11 @@ def train_stage_a(
             "label_mean": label_mean,
             "label_std": label_std,
             "best_metric": best_metric_name,
-            "best_score": best_score if best_score != (float("inf") if minimize else -float("inf")) else None,
+            "best_score": (
+                best_score
+                if best_score != (float("inf") if minimize else -float("inf"))
+                else None
+            ),
         }
         ckpt_path = os.path.join(save_dir, ckpt_name)
         torch.save(ckpt, ckpt_path)

@@ -14,15 +14,15 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from modelsv2.data import build_raw_dataloaders, prepare_prompts
-from modelsv2.llama_backbone import FrozenLlama
-from modelsv2.modules import (
+from peer.data import build_raw_dataloaders, prepare_prompts
+from peer.llama_backbone import FrozenLlama
+from peer.modules import (
     InferenceHead,
     PerceiverCompressor,
     ScalarLabelEmbedder,
     SlotSelector,
 )
-from modelsv2.utils import huber_loss, regression_metrics
+from peer.utils import huber_loss, regression_metrics
 
 
 def set_seed(seed: int):

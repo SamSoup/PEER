@@ -9,7 +9,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from modelsv2.modules import SlotSelector
+from peer.modules import SlotSelector
 
 
 def greedy_dedup(logits_full: torch.Tensor):
@@ -193,7 +193,11 @@ def main():
     proto_info = []
     for idx in prototypes.tolist():
         proto_info.append(
-            {"idx": idx, "y": float(y_cache[idx].item()), "text": text_cache[idx]}
+            {
+                "idx": idx,
+                "y": float(y_cache[idx].item()),
+                "text": text_cache[idx],
+            }
         )
     with open(out_json, "w") as f:
         json.dump(proto_info, f, ensure_ascii=True, indent=2)

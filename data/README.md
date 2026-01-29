@@ -20,7 +20,7 @@ Canonical names (aliases shown in code) mapped to HF sources and label ranges:
 - `wmt20-ru-en` → `samsoup/Samsoup-WMT2020-ru-en` (label_max=100.0)
 - `wmt20-si-en` → `samsoup/Samsoup-WMT2020-si-en` (label_max=100.0)
 
-Add new pairwise datasets by extending `PAIRWISE_DATASETS` (and optional `PAIRWISE_NAME_ALIASES`) in `pairwise_dataset_modules.py`.
+Add new pairwise datasets by extending `DATASET_METAS` (and optional `DATASET_ALIASES`) in `data/datasets.py`.
 
 ## Future single-sentence datasets
 When adding one-sentence → score datasets, create a small registry/builder around `SingleSentenceRegressionDataModule` and update `get_datamodule(...)` to route to it. A new helper file mirroring `pairwise_dataset_modules.py` will keep that logic isolated.

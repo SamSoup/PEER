@@ -3,6 +3,8 @@ import os
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+from peer.utils import ensure_hf_cache
+
 
 DEFAULT_PROMPT_TMPL = "Input:\n{text}\n\nPredict a score from 1 to 4:"
 
@@ -11,15 +13,18 @@ class FrozenLlama:
     """Wrapper around a frozen decoder-only LLaMA backbone."""
 
     def __init__(self, model_name: str, device: str):
-        hf_home = os.environ.get("HF_HOME", None)
-        cache_kwargs = {"cache_dir": hf_home} if hf_home else {}
+        hf_home = ensure_hf_cache()
+        torch.cuda.empty_cache()
+        cache_kwargs = {"cache_dir": hf_home}
         self.tok = AutoTokenizer.from_pretrained(
             model_name, use_fast=True, **cache_kwargs
         )
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.model = AutoModel.from_pretrained(
-            model_name, torch_dtype=torch.float16, **cache_kwargs
+            model_name,
+            dtype=torch.bfloat16,
+            **cache_kwargs,
         )
         self.model.eval()
         for p in self.model.parameters():
@@ -27,7 +32,9 @@ class FrozenLlama:
         self.model.to(device)
         self.device = device
 
-    def encode(self, texts, max_length: int = 256, already_prompted: bool = False):
+    def encode(
+        self, texts, max_length: int = 256, already_prompted: bool = False
+    ):
         """
         Tokenize and encode a list of prompts.
         If already_prompted=False, wraps raw text with the default template.

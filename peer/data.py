@@ -1,53 +1,66 @@
+from __future__ import annotations
+
 from torch.utils.data import DataLoader
 
-from data.factory import get_datamodule
+from data.factory import build_pairwise_datamodule
 from peer.prompting import build_prompts
-
-
-def _resolve_val_split(dm):
-    if getattr(dm, "eval_splits", None):
-        return dm.eval_splits[0] if dm.eval_splits else None
-    if dm.dataset and "validation" in dm.dataset:
-        return "validation"
-    return None
 
 
 def build_raw_dataloaders(
     *,
-    dataset_name: str,
-    model_name: str,
+    dataset_name: str,  # registry key or alias
+    model_name: str,  # tokenizer name (only used to pick sep token if needed)
     batch_size: int = 16,
     max_length: int = 256,
     combine_fields: bool = False,
+    combine_separator_token: str | None = None,
+    num_workers: int = 0,
+    pin_memory: bool = True,
 ):
     """
-    Instantiate datamodule from /data and return raw-text train/val dataloaders.
+    Instantiate PairSentenceRegressionDataModule and return raw-text train/val loaders.
+
+    Uses the new registry-driven datamodule builder, but forces tokenize_inputs=False so
+    examples stay as raw text:
+      - combined: {"text": str, "labels": float}
+      - not combined: {"text": (str,str), "labels": float}
     """
-    dm = get_datamodule(
+    dm = build_pairwise_datamodule(
         dataset_name=dataset_name,
         model_name=model_name,
-        max_seq_length=max_length,
+        max_seq_length=max_length,  # unused by raw path but kept consistent
         batch_size=batch_size,
         tokenize_inputs=False,
         combine_fields=combine_fields,
+        combine_separator_token=combine_separator_token,
     )
+    if dm is None:
+        raise ValueError(f"Unsupported dataset name: {dataset_name}")
+
+    dm.train_batch_size = batch_size
+    dm.eval_batch_size = batch_size
+    dm.num_workers = num_workers
+    dm.pin_memory = pin_memory
+
     dm.setup("fit")
-    collate = dm._collate_raw
+
     train_loader = DataLoader(
         dm.dataset["train"],
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=collate,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=dm._collate_raw,
     )
-    val_split = _resolve_val_split(dm)
-    val_loader = None
-    if val_split:
-        val_loader = DataLoader(
-            dm.dataset[val_split],
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collate,
-        )
+    val_loader = DataLoader(
+        dm.dataset["validation"],
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=dm._collate_raw,
+    )
+
     return train_loader, val_loader, dm
 
 
@@ -56,23 +69,31 @@ def prepare_prompts(texts, dataset_name: str | None):
     return build_prompts(texts, dataset_name)
 
 
-def build_cache_loader(dm, batch_size: int):
+def build_cache_loader(
+    dm, batch_size: int, *, num_workers: int = 0, pin_memory: bool = True
+):
     """Non-shuffled loader over the training split for cache construction."""
+    dm.setup("fit")
     return DataLoader(
         dm.dataset["train"],
         batch_size=batch_size,
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=dm._collate_raw,
     )
 
 
-def build_test_loader(dm, batch_size: int):
+def build_test_loader(
+    dm, batch_size: int, *, num_workers: int = 0, pin_memory: bool = True
+):
     """Loader over the test split for evaluation."""
-    if "test" not in dm.dataset:
-        raise ValueError("Datamodule does not have a test split.")
+    dm.setup("test")
     return DataLoader(
         dm.dataset["test"],
         batch_size=batch_size,
         shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=dm._collate_raw,
     )

@@ -1,16 +1,9 @@
 import argparse
 import os
 import sys
-import random
-
-import numpy as np
 import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
-
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 
 from peer.data import build_raw_dataloaders, prepare_prompts
 from peer.llama_backbone import FrozenLlama
@@ -21,19 +14,13 @@ from peer.modules import (
     KeyReadout,
 )
 from peer.utils import (
+    get_hidden_size,
     huber_loss,
     regression_metrics,
     set_label_stats_from_loader,
+    set_seed,
+    ensure_hf_cache,
 )
-
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def train_stage_a(
@@ -57,10 +44,12 @@ def train_stage_a(
     save_dir: str = ".",
     ckpt_name: str = "stageA.pt",
     best_metric: str = "val_loss",
+    patience: int = 0,
+    min_rate: float = 0.0,
 ):
     set_seed(seed)
     llama = FrozenLlama(model_name, device)
-    d_model = llama.model.config.hidden_size
+    d_model = get_hidden_size(llama.model)
 
     train_loader, val_loader, dm = build_raw_dataloaders(
         dataset_name=dataset,
@@ -108,6 +97,7 @@ def train_stage_a(
     best_score = float("inf") if minimize else -float("inf")
     best_ckpt = None
     best_path = None
+    epochs_since_improve = 0
 
     # Quick input/tokenization sanity on first batch
     first_batch = next(iter(train_loader))
@@ -211,6 +201,7 @@ def train_stage_a(
 
         val_loss = None
         metrics = None
+        current_score = None
         if val_loader is not None:
             Wm.eval(), Wq.eval(), MemComp.eval(), QueryComp.eval()
             LabelEmb.eval(), Inference.eval()
@@ -270,7 +261,6 @@ def train_stage_a(
                     print(stats_msg)
                 else:
                     metrics = None
-                current_score = None
                 if best_metric_name == "val_loss":
                     current_score = val_loss
                 elif metrics is not None:
@@ -281,11 +271,12 @@ def train_stage_a(
                     current_score is not None and current_score == current_score
                 ):  # not NaN
                     if minimize:
-                        better = current_score < best_score
+                        better = current_score < (best_score - min_rate)
                     else:
-                        better = current_score > best_score
+                        better = current_score > (best_score + min_rate)
 
                 if better:
+                    epochs_since_improve = 0
                     best_score = current_score
                     best_ckpt = {
                         "model_name": model_name,
@@ -316,6 +307,8 @@ def train_stage_a(
                     print(
                         f"Saved new best Stage A to {os.path.abspath(best_path)} ({best_metric_name}={best_score:.4f})"
                     )
+                elif current_score is not None and patience > 0:
+                    epochs_since_improve += 1
 
         print(
             f"Epoch {epoch+1}/{epochs} - train_loss={train_loss:.4f}"
@@ -330,6 +323,20 @@ def train_stage_a(
                     if v == v  # skip NaN
                 )
             )
+
+        if (
+            patience > 0
+            and epochs_since_improve >= patience
+            and best_ckpt is not None
+        ):
+            msg = (
+                f"[StageA] Early stopping at epoch {epoch+1} after {epochs_since_improve} "
+                f"epochs without improvement >= {min_rate}."
+            )
+            if best_path is not None and os.path.exists(best_path):
+                msg += f" Best checkpoint already on disk at {os.path.abspath(best_path)}."
+            print(msg)
+            break
 
     if best_ckpt is None:
         ckpt = {
@@ -456,9 +463,22 @@ def main():
         default="val_loss",
         help="Metric to select best checkpoint (min for val_loss/mse/rmse, max for correlations).",
     )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="Epochs with no improvement >= min_rate before early stop (0 disables).",
+    )
+    parser.add_argument(
+        "--min_rate",
+        type=float,
+        default=0.01,
+        help="Minimum improvement required to reset patience (direction depends on metric).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
     os.makedirs(args.save_dir, exist_ok=True)
     train_stage_a(
         model_name=args.model_name,
@@ -481,6 +501,8 @@ def main():
         save_dir=args.save_dir,
         ckpt_name=args.ckpt_name,
         best_metric=args.best_metric,
+        patience=args.patience,
+        min_rate=args.min_rate,
     )
 
 

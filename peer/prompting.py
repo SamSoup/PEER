@@ -1,75 +1,24 @@
 """
-Prompt helpers that mirror the dataset->prompt mapping in inference/prompts.py.
+Prompt helpers that mirror the dataset->prompt mapping in data/datasets.py.
 Builds a full prompt string (system + user message) for a given dataset key.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-import importlib.util
 from typing import Iterable, List, Tuple, Union
 
+from data.pair_dataset_registry import PROMPT_TEMPLATES, get_dataset_meta
 
-def _load_prompt_templates():
-    """
-    Load PROMPT_TEMPLATES from inference/prompts.py without requiring a package import.
-    """
-    base_dir = Path(__file__).resolve().parent.parent
-    prompt_path = base_dir / "inference" / "prompts.py"
-    spec = importlib.util.spec_from_file_location(
-        "modelsv2_prompt_templates", prompt_path
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)  # type: ignore[arg-type]
-    return module.PROMPT_TEMPLATES
-
-
-PROMPT_TEMPLATES = _load_prompt_templates()
 
 RawText = Union[str, Tuple[str, str], List[str], List[Tuple[str, str]]]
 
 
-# Map dataset names/aliases -> prompt template keys in inference/prompts.py
-DATASET_PROMPT_MAP = {
-    "stsb": "stsb",
-    "stsbenchmark": "stsbenchmark_mteb",
-    "stsbenchmark-mteb": "stsbenchmark_mteb",
-    "stsbenchmark_mteb": "stsbenchmark_mteb",
-    "stsbench-mteb": "stsbenchmark_mteb",
-    "sickr": "sickr_sts",
-    "sickr-sts": "sickr_sts",
-    "sickr_sts": "sickr_sts",
-    "sts22": "sts22",
-    "sts22-crosslingual-sts": "sts22",
-    "sts22_crosslingual_sts": "sts22",
-    "sts22-xling-sts": "sts22",
-    "wmt20-ru-en": "wmt_en_ru",
-    "wmt20_ru_en": "wmt_en_ru",
-    "wmt20-en-ru": "wmt_en_ru",
-    "wmt_en_ru": "wmt_en_ru",
-    "wmt20-en-zh": "wmt_en_zh",
-    "wmt20_en_zh": "wmt_en_zh",
-    "wmt_en_zh": "wmt_en_zh",
-    "wmt20-si-en": "wmt_si_en",
-    "wmt20_si_en": "wmt_si_en",
-    "wmt_si_en": "wmt_si_en",
-}
-
 DEFAULT_TMPL = "Input:\n{text}\n\nPredict a score from 1 to 4:"
 
 
-def canonical_dataset_name(name: str | None) -> str | None:
-    if not name:
-        return None
-    return name.strip().lower().replace(" ", "")
-
-
 def prompt_key_for_dataset(dataset_name: str | None) -> str | None:
-    canonical = canonical_dataset_name(dataset_name)
-    if canonical is None:
-        return None
-    return DATASET_PROMPT_MAP.get(canonical, canonical if canonical in PROMPT_TEMPLATES else None)
+    meta = get_dataset_meta(dataset_name)
+    return meta.prompt_key if meta else None
 
 
 def _maybe_split_combined(text: str) -> Tuple[str, str] | None:
@@ -85,7 +34,9 @@ def _maybe_split_combined(text: str) -> Tuple[str, str] | None:
     return None
 
 
-def build_prompt_for_example(text: RawText, dataset_name: str | None = None) -> str:
+def build_prompt_for_example(
+    text: RawText, dataset_name: str | None = None
+) -> str:
     """
     Build a single prompt string for a raw example (string or (s1,s2)).
     Falls back to a generic template when no dataset-specific prompt exists.
@@ -118,6 +69,8 @@ def build_prompt_for_example(text: RawText, dataset_name: str | None = None) -> 
     return DEFAULT_TMPL.format(text=raw)
 
 
-def build_prompts(texts: Iterable[RawText], dataset_name: str | None = None) -> List[str]:
+def build_prompts(
+    texts: Iterable[RawText], dataset_name: str | None = None
+) -> List[str]:
     """Vectorized helper over a batch of raw texts."""
     return [build_prompt_for_example(t, dataset_name) for t in texts]

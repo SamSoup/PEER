@@ -3,14 +3,18 @@ import json
 import os
 import random
 from typing import List, Optional
+import re
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from prompts import PROMPT_TEMPLATES
-from pair_dataset_api import (
-    DATASET_CONFIGS,
+from data.pair_dataset_registry import (
+    DATASET_ALL_KEYS,
+    PROMPT_TEMPLATES,
+    get_dataset_meta,
     parse_score,
+)
+from pair_dataset_api import (
     sample_icl_examples,
     compute_metrics,
     write_predictions,
@@ -35,16 +39,31 @@ def ensure_hf_cache():
     )
 
 
-def build_prompt(tokenizer, system_prompt: str, user_prompt: str) -> str:
+def is_qwen3_model(model_id: str) -> bool:
+    if not model_id:
+        return False
+    name = model_id.lower()
+    return "qwen3" in name or "qwen-3" in name or "qwen 3" in name
+
+
+def build_prompt(
+    tokenizer, system_prompt: str, user_prompt: str, model_id: str
+) -> str:
     """Prefer chat template; fall back to plain text."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     if hasattr(tokenizer, "apply_chat_template"):
+        extra_kwargs = (
+            {"enable_thinking": False} if is_qwen3_model(model_id) else {}
+        )
         try:
             return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **extra_kwargs,
             )
         except Exception:
             pass
@@ -75,7 +94,7 @@ def load_local_model(model_path: str, device_map: str, torch_dtype: str):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map=device_map,
-        torch_dtype=dtype,
+        dtype=dtype,
         cache_dir=os.environ["HF_HOME"],
     )
     if tokenizer.pad_token_id is None:
@@ -120,6 +139,15 @@ def generate_local_completion(
     return completions
 
 
+def strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks (e.g., Qwen reasoning) before parsing."""
+    if not text:
+        return text
+    return re.sub(
+        r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
+
+
 def run_eval(
     dataset_key: str,
     model_path: str,
@@ -133,13 +161,14 @@ def run_eval(
     max_new_tokens: int,
     temperature: float,
     batch_size: int,
+    progress_every: int,
 ) -> None:
-    if dataset_key not in DATASET_CONFIGS:
+    meta_cfg = get_dataset_meta(dataset_key)
+    if meta_cfg is None:
         raise ValueError(f"Unknown dataset key: {dataset_key}")
 
     ensure_hf_cache()
-    config = DATASET_CONFIGS[dataset_key]
-    prompt_template = PROMPT_TEMPLATES[config.prompt_key]
+    prompt_template = PROMPT_TEMPLATES[meta_cfg.prompt_key]
 
     os.makedirs(out_dir, exist_ok=True)
     random.seed(seed)
@@ -148,23 +177,22 @@ def run_eval(
     from datasets import load_dataset  # pylint: disable=import-outside-toplevel
     from tqdm.auto import tqdm  # pylint: disable=import-outside-toplevel
 
-    ds = load_dataset(config.hf_id)
+    ds = load_dataset(meta_cfg.hf_id)
     train_split = (
-        ds["train"] if config.uses_train_split and "train" in ds else None
+        ds["train"] if meta_cfg.uses_train_split and "train" in ds else None
     )
     test_split = ds["test"]
 
-    if train_split is None and icl_n and config.disable_icl_if_missing_train:
+    if train_split is None and icl_n and meta_cfg.disable_icl_if_missing_train:
         print("No train split available; disabling ICL sampling.")
         icl_n = 0
 
-    icl_examples = sample_icl_examples(train_split, icl_n, config)
+    icl_examples = sample_icl_examples(train_split, icl_n, meta_cfg)
 
     model, tokenizer = load_local_model(model_path, device_map, torch_dtype)
 
-    buffers = {
-        scale.name: {"gold": [], "pred": []} for scale in config.metric_scales
-    }
+    gold_buffer: List[float] = []
+    pred_buffer: List[float] = []
     rows_for_dump = []
 
     total = len(test_split) if limit is None else min(len(test_split), limit)
@@ -182,13 +210,13 @@ def run_eval(
             i = start + idx_offset
             s1 = row["sentence1"]
             s2 = row["sentence2"]
-            gold_raw = float(row[config.score_field])
+            gold_raw = float(row[meta_cfg.score_field])
 
             user_msg = prompt_template.build_user_message(
                 s1, s2, icl_examples, use_cot
             )
             prompt_text = build_prompt(
-                tokenizer, prompt_template.system, user_msg
+                tokenizer, prompt_template.system, user_msg, model_path
             )
             prompts.append(prompt_text)
             meta.append((i, row, gold_raw))
@@ -208,8 +236,9 @@ def run_eval(
             continue
 
         for (i, row, gold_raw), raw_answer in zip(meta, raw_answers):
+            cleaned_answer = strip_think_tags(raw_answer)
             try:
-                pred_raw = parse_score(raw_answer, config)
+                pred_raw = parse_score(cleaned_answer, meta_cfg)
             except Exception as e:  # pylint: disable=broad-exception-caught
                 print(
                     f"[{i}] ERROR parsing model output: {e} | raw: {raw_answer}"
@@ -220,31 +249,28 @@ def run_eval(
                 "idx": i,
                 "sentence1": row["sentence1"],
                 "sentence2": row["sentence2"],
+                "gold_score": gold_raw,
+                "pred_score": pred_raw,
                 "raw_model_reply": raw_answer,
             }
 
-            for scale in config.metric_scales:
-                gold_val = scale.gold_transform(gold_raw)
-                pred_val = scale.pred_transform(pred_raw)
-                buffers[scale.name]["gold"].append(gold_val)
-                buffers[scale.name]["pred"].append(pred_val)
-                row_record[scale.gold_column] = gold_val
-                row_record[scale.pred_column] = pred_val
+            gold_buffer.append(gold_raw)
+            pred_buffer.append(pred_raw)
 
             rows_for_dump.append(row_record)
-            print_progress(i, row_record, config.metric_scales)
+            print_progress(i, row_record, progress_every)
 
-    metrics = compute_metrics(buffers, config.metric_scales)
+    metrics = compute_metrics(pred_buffer, gold_buffer)
 
     preds_path = os.path.join(out_dir, "predictions.csv")
     metrics_path = os.path.join(out_dir, "metrics.json")
     icl_path = os.path.join(out_dir, "icl_examples.json")
 
-    write_predictions(rows_for_dump, preds_path, config.metric_scales)
+    write_predictions(rows_for_dump, preds_path)
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "dataset": dataset_key,
+                "dataset": meta_cfg.key,
                 "model_name_or_path": model_path,
                 "icl_n": int(len(icl_examples)),
                 "metrics": metrics,
@@ -256,20 +282,11 @@ def run_eval(
         json.dump(icl_examples, f, indent=2)
 
     print("=======================================")
-    for scale in config.metric_scales:
-        scale_metrics = metrics[scale.name]
-        print(f"{scale.name.upper()} ({scale.label_desc})")
-        if scale_metrics["pearson_correlation"] is not None:
-            print(f"Pearson: {scale_metrics['pearson_correlation']:.4f}")
-        if scale_metrics["spearman_correlation"] is not None:
-            print(f"Spearman: {scale_metrics['spearman_correlation']:.4f}")
-        if scale_metrics["kendall_correlation"] is not None:
-            print(f"Kendall τ: {scale_metrics['kendall_correlation']:.4f}")
-        if scale_metrics["mse"] is not None:
-            print(f"MSE:  {scale_metrics['mse']:.6f}")
-            print(f"RMSE: {scale_metrics['rmse']:.6f}")
-        print(f"In-context examples used: {len(icl_examples)}")
-        print("---")
+    for name, val in metrics.items():
+        if val is not None:
+            print(f"{name.upper()}: {val:.3f}")
+    print(f"In-context examples used: {len(icl_examples)}")
+    print("---")
 
     print(f"Saved predictions to: {preds_path}")
     print(f"Saved metrics to:     {metrics_path}")
@@ -284,7 +301,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         required=True,
-        choices=sorted(DATASET_CONFIGS.keys()),
+        choices=DATASET_ALL_KEYS,
         help="Which dataset to evaluate.",
     )
     parser.add_argument(
@@ -352,6 +369,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Batch size for local generation.",
     )
+    parser.add_argument(
+        "--progress_every",
+        type=int,
+        default=100,
+        help="Print progress every N evaluated pairs; set to 0 or below to disable.",
+    )
     return parser.parse_args()
 
 
@@ -370,4 +393,5 @@ if __name__ == "__main__":
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         batch_size=args.batch_size,
+        progress_every=args.progress_every,
     )

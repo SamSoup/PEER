@@ -3,8 +3,9 @@ data/push_to_hub/
 analysis/
 configs/
 experiments/
-commands/
+*commands/
 *commands.md
+debug_llama_load.py
 
 inference/wrapperbox
 *test.ipynb
@@ -13,6 +14,5 @@ models/
 results/
 
 run_experiments.py
-train_vanilla.py
 TRAINING.md
 train.py

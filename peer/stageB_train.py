@@ -22,16 +22,7 @@ from peer.modules import (
     ScalarLabelEmbedder,
     SlotSelector,
 )
-from peer.utils import huber_loss, regression_metrics
-
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+from peer.utils import ensure_hf_cache, huber_loss, regression_metrics, set_seed
 
 
 def hash_state_dict(state_dict):
@@ -201,9 +192,22 @@ def main():
         default="val_loss",
         help="Metric to select best checkpoint (min for val_loss/mse/rmse, max for correlations).",
     )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="Epochs with no improvement >= min_rate before early stop (0 disables).",
+    )
+    parser.add_argument(
+        "--min_rate",
+        type=float,
+        default=0.01,
+        help="Minimum improvement required to reset patience (direction depends on metric).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    ensure_hf_cache()
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
     cache_mem = torch.load(
@@ -342,6 +346,8 @@ def main():
     best_score = float("inf") if minimize else -float("inf")
     best_ckpt = None
     best_path = None
+    epochs_since_improve = 0
+    warmup_epochs = max(args.freeze_epochs, args.no_regularizer_epochs)
 
     for epoch in range(args.epochs):
         selector.train()
@@ -473,6 +479,7 @@ def main():
 
         val_loss = None
         val_metrics = None
+        current_score = None
         if val_loader is not None:
             selector.eval()
             Wq.eval(), QueryComp.eval(), LabelEmb.eval(), Inference.eval()
@@ -569,7 +576,6 @@ def main():
                     return v_loss, val_metrics_local
 
                 val_loss, val_metrics = run_val(tau)
-                current_score = None
                 if best_metric_name == "val_loss":
                     current_score = val_loss
                 elif val_metrics is not None:
@@ -578,11 +584,12 @@ def main():
                 better = False
                 if current_score is not None and current_score == current_score:
                     if minimize:
-                        better = current_score < best_score
+                        better = current_score < (best_score - args.min_rate)
                     else:
-                        better = current_score > best_score
+                        better = current_score > (best_score + args.min_rate)
 
                 if better:
+                    epochs_since_improve = 0
                     best_score = current_score
                     best_ckpt = {
                         "model_name": args.model_name,
@@ -613,6 +620,12 @@ def main():
                     print(
                         f"Saved new best Stage B to {os.path.abspath(best_path)} ({best_metric_name}={best_score:.4f})"
                     )
+                elif (
+                    current_score is not None
+                    and args.patience > 0
+                    and epoch >= warmup_epochs
+                ):
+                    epochs_since_improve += 1
 
         print(
             f"Epoch {epoch+1}/{args.epochs} - tau={tau:.3f} "
@@ -626,6 +639,21 @@ def main():
                     f"{k}={v:.4f}" for k, v in val_metrics.items() if v == v
                 )
             )
+
+        if (
+            args.patience > 0
+            and epoch >= warmup_epochs
+            and epochs_since_improve >= args.patience
+            and best_ckpt is not None
+        ):
+            msg = (
+                f"[StageB] Early stopping at epoch {epoch+1} after {epochs_since_improve} "
+                f"epochs without improvement >= {args.min_rate}."
+            )
+            if best_path is not None and os.path.exists(best_path):
+                msg += f" Best checkpoint already on disk at {os.path.abspath(best_path)}."
+            print(msg)
+            break
 
     if best_ckpt is None:
         ckpt_b = {

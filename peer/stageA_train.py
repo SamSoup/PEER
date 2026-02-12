@@ -19,7 +19,6 @@ from peer.utils import (
     regression_metrics,
     set_label_stats_from_loader,
     set_seed,
-    ensure_hf_cache,
 )
 
 
@@ -90,6 +89,38 @@ def train_stage_a(
         + list(Inference.parameters())
         + list(KeyRO.parameters())
         + list(g_emb.parameters())
+    )
+    all_modules = [
+        llama.model,
+        Wm,
+        Wq,
+        MemComp,
+        QueryComp,
+        LabelEmb,
+        Inference,
+        KeyRO,
+        g_emb,
+    ]
+    seen_params = set()
+    trainable_params = 0
+    all_params = 0
+    for module in all_modules:
+        for p in module.parameters():
+            pid = id(p)
+            if pid in seen_params:
+                continue
+            seen_params.add(pid)
+            n = p.numel()
+            all_params += n
+            if p.requires_grad:
+                trainable_params += n
+    trainable_pct = 0.0 if all_params == 0 else 100.0 * trainable_params / all_params
+    print(
+        "trainable params: {trainable:,} || all params: {allp:,} || trainable%: {pct:.4f}".format(
+            trainable=trainable_params,
+            allp=all_params,
+            pct=trainable_pct,
+        )
     )
     optim = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     best_metric_name = best_metric

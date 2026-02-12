@@ -358,10 +358,25 @@ class LoraCausalLMRegressor(pl.LightningModule):
     def _prompt_only_inputs(
         self, batch: Dict[str, Any]
     ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
+        """
+        Build prompt-only inputs for generation WITHOUT introducing right-padding.
 
+        We:
+          1) find where completion starts (first label != -100),
+          2) slice prompt tokens up to that point,
+          3) strip any existing pads via attention_mask,
+          4) re-pad with tokenizer.pad (respects tokenizer.padding_side, set to 'left').
+        """
+        if self.tokenizer is None:
+            raise RuntimeError(
+                "Attach tokenizer before testing: model.tokenizer = dm.tokenizer"
+            )
+
+        input_ids: torch.Tensor = batch["input_ids"]
+        attention_mask: torch.Tensor = batch["attention_mask"]
+        labels: torch.Tensor = batch["labels"]
+
+        # Find completion start index per example (first non -100 label)
         prompt_lens: List[int] = []
         for i in range(labels.size(0)):
             idx = (labels[i] != -100).nonzero(as_tuple=False)
@@ -369,21 +384,81 @@ class LoraCausalLMRegressor(pl.LightningModule):
                 int(idx[0].item()) if idx.numel() else labels.size(1)
             )
 
-        max_prompt = max(prompt_lens) if prompt_lens else input_ids.size(1)
-        prompt_ids = input_ids[:, :max_prompt].clone()
-        prompt_attn = attention_mask[:, :max_prompt].clone()
-
-        # force pad_id to a plain int
-        pad_id = self._as_int_token_id(
-            self.model.config.pad_token_id, default=0
-        )
-
+        # Build per-example feature dicts with pads stripped
+        feats: List[Dict[str, Any]] = []
         for i, L in enumerate(prompt_lens):
-            if L < max_prompt:
-                prompt_ids[i, L:] = pad_id
-                prompt_attn[i, L:] = 0
+            ids = input_ids[i, :L]
+            attn = attention_mask[i, :L]
+
+            # Strip existing pads so tokenizer.pad can re-pad cleanly
+            ids = ids[attn.bool()]
+            feats.append(
+                {
+                    "input_ids": ids.detach().cpu().tolist(),
+                    "attention_mask": [1] * int(ids.numel()),
+                }
+            )
+
+        # Ensure left padding for decoder-only generation
+        self.tokenizer.padding_side = "left"
+
+        padded = self.tokenizer.pad(feats, padding=True, return_tensors="pt")
+        prompt_ids = padded["input_ids"].to(self.device)
+        prompt_attn = padded["attention_mask"].to(self.device)
 
         return prompt_ids, prompt_attn, prompt_lens
+
+    @torch.no_grad()
+    def _generate_pred_scores(
+        self, batch: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """
+        Generate score strings from prompt-only inputs, then parse them.
+
+        Because we re-pad prompts to a common length, the generated "new tokens"
+        start at input_len for all examples.
+        """
+        if self.tokenizer is None:
+            raise RuntimeError(
+                "Attach tokenizer before testing: model.tokenizer = dm.tokenizer"
+            )
+
+        prompt_ids, prompt_attn, _prompt_lens = self._prompt_only_inputs(batch)
+        input_len = int(prompt_ids.size(1))
+
+        temperature = float(self.hparams.gen_temperature)
+        top_p = float(self.hparams.gen_top_p)
+        do_sample = temperature > 1e-8
+
+        gen = self.model.generate(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attn,
+            max_new_tokens=int(self.hparams.gen_max_new_tokens),
+            do_sample=do_sample,
+            temperature=(temperature if do_sample else None),
+            top_p=(top_p if do_sample else None),
+            pad_token_id=self.model.config.pad_token_id,
+            eos_token_id=self.model.config.eos_token_id,
+        )
+
+        pred_vals: List[float] = []
+        pred_texts: List[str] = []
+
+        for i in range(gen.size(0)):
+            # Everything after input_len is newly generated
+            tail = gen[i, input_len:].detach().cpu().tolist()
+            txt = self.tokenizer.decode(tail, skip_special_tokens=True).strip()
+            pred_texts.append(txt)
+            try:
+                v = parse_score(txt, self.dataset_key)
+            except Exception:
+                v = float("nan")
+            pred_vals.append(float(v))
+
+        return (
+            torch.tensor(pred_vals, device=self.device, dtype=torch.float32),
+            pred_texts,
+        )
 
     def _decode_gold_scores(
         self, batch: Dict[str, Any]
@@ -408,49 +483,6 @@ class LoraCausalLMRegressor(pl.LightningModule):
         return (
             torch.tensor(gold_vals, device=self.device, dtype=torch.float32),
             gold_texts,
-        )
-
-    @torch.no_grad()
-    def _generate_pred_scores(
-        self, batch: Dict[str, Any]
-    ) -> Tuple[torch.Tensor, List[str]]:
-        if self.tokenizer is None:
-            raise RuntimeError(
-                "Attach tokenizer before testing: model.tokenizer = dm.tokenizer"
-            )
-
-        prompt_ids, prompt_attn, prompt_lens = self._prompt_only_inputs(batch)
-
-        temperature = float(self.hparams.gen_temperature)
-        top_p = float(self.hparams.gen_top_p)
-        do_sample = temperature > 1e-8
-
-        gen = self.model.generate(
-            input_ids=prompt_ids,
-            attention_mask=prompt_attn,
-            max_new_tokens=int(self.hparams.gen_max_new_tokens),
-            do_sample=do_sample,
-            temperature=(temperature if do_sample else None),
-            top_p=(top_p if do_sample else None),
-            pad_token_id=self.model.config.pad_token_id,
-            eos_token_id=self.model.config.eos_token_id,
-        )
-
-        pred_vals: List[float] = []
-        pred_texts: List[str] = []
-        for i in range(gen.size(0)):
-            tail = gen[i, prompt_lens[i] :].detach().cpu().tolist()
-            txt = self.tokenizer.decode(tail, skip_special_tokens=True).strip()
-            pred_texts.append(txt)
-            try:
-                v = parse_score(txt, self.dataset_key)
-            except Exception:
-                v = float("nan")
-            pred_vals.append(float(v))
-
-        return (
-            torch.tensor(pred_vals, device=self.device, dtype=torch.float32),
-            pred_texts,
         )
 
     def _as_int_token_id(self, x, default: int = 0) -> int:

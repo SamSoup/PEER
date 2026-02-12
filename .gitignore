@@ -16,3 +16,7 @@ results/
 run_experiments.py
 TRAINING.md
 train.py
+
+*sbatch/
+
+/visualization

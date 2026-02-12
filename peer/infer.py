@@ -1,11 +1,11 @@
 import argparse
 import json
 import os
-import random
 import sys
 
 import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
@@ -101,6 +101,9 @@ def main():
     Wq.eval(), QueryComp.eval(), LabelEmb.eval(), Inference.eval()
     torch.set_grad_enabled(False)
     standardize = bool(ckpt.get("standardize_labels", True))
+    if standardize:
+        print("Is standardized!")
+
     y_std = LabelEmb.y_std.item() + 1e-8
     y_mean = LabelEmb.y_mean.item()
 
@@ -145,9 +148,11 @@ def main():
     def run_eval(dataloader, split_name):
         preds_all = []
         labels_all = []
-        for batch in dataloader:
+        texts_all = []
+        for batch in tqdm(dataloader, desc=f"Evaluating {split_name}"):
             prompts = prepare_prompts(batch["text"], dataset_name=args.dataset)
             labels = batch["labels"].to(device).float()
+            texts_all.extend(list(batch["text"]))
             Hq = llama.encode(
                 prompts, max_length=args.max_length, already_prompted=True
             ).float()
@@ -163,9 +168,60 @@ def main():
         preds_cat = torch.cat(preds_all)
         labels_cat = torch.cat(labels_all)
         metrics_local = regression_metrics(preds_cat, labels_cat)
-        return preds_cat, labels_cat, metrics_local
+        return preds_cat, labels_cat, metrics_local, texts_all
 
-    preds_cat, labels_cat, metrics = run_eval(test_loader, "test")
+    def contribution_importance_to_prototypes(
+        contrib_layers,
+        grad_r,
+        n_proto,
+        tokens_per_proto,
+        batch_size,
+    ):
+        n_mem = n_proto * tokens_per_proto
+        if (
+            not isinstance(contrib_layers, (list, tuple))
+            or len(contrib_layers) == 0
+        ):
+            raise ValueError("Expected non-empty per-layer contribution list.")
+
+        def normalize_to_btne(contrib_one):
+            if contrib_one.dim() != 4:
+                raise ValueError(
+                    "Expected contribution tensor rank-4 [B,T,N,E], got "
+                    f"{tuple(contrib_one.shape)}"
+                )
+            if contrib_one.shape[0] == batch_size:
+                btne = contrib_one
+            elif contrib_one.shape[1] == batch_size:
+                btne = contrib_one.transpose(0, 1)
+            else:
+                raise ValueError(
+                    "Could not identify batch dimension in contribution shape "
+                    f"{tuple(contrib_one.shape)}"
+                )
+            if btne.shape[2] != n_mem:
+                raise ValueError(
+                    f"Unexpected contribution shape {tuple(contrib_one.shape)} "
+                    f"for n_mem={n_mem}"
+                )
+            return btne
+
+        layer_scores = []
+        for contrib_l in contrib_layers:
+            btne = normalize_to_btne(contrib_l)
+            B, T, _, E = btne.shape
+            proto_vec = btne.reshape(B, T, n_proto, tokens_per_proto, E).sum(
+                dim=3
+            )  # [B,T,K,E]
+            # Faithful additive contribution across readout tokens.
+            proto_vec = proto_vec.sum(dim=1)  # [B,K,E]
+            layer_score = (proto_vec * grad_r.unsqueeze(1)).sum(dim=-1)  # [B,K]
+            layer_scores.append(layer_score)
+
+        # Total signed contribution across all inference layers.
+        return torch.stack(layer_scores, dim=0).sum(dim=0)  # [B,K]
+
+    preds_cat, labels_cat, metrics, eval_texts = run_eval(test_loader, "test")
     metrics_path = os.path.join(args.save_dir, args.metrics_name)
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
@@ -176,7 +232,7 @@ def main():
     )
 
     if args.run_val and val_loader is not None:
-        _, _, metrics_val = run_eval(val_loader, "val")
+        _, _, metrics_val, _ = run_eval(val_loader, "val")
         val_path = os.path.join(args.save_dir, "metrics_val.json")
         with open(val_path, "w") as f:
             json.dump(metrics_val, f, indent=2)
@@ -187,40 +243,84 @@ def main():
             )
         )
 
-    # Explanations: sample 5 random test examples
-    test_ds = dm.dataset["test"]
-    sample_idxs = random.sample(range(len(test_ds)), k=min(5, len(test_ds)))
+    # Explanations: write all test examples (evaluation order)
+    if len(eval_texts) != preds_cat.numel():
+        raise ValueError(
+            "Evaluated text count mismatch with predictions: "
+            f"{len(eval_texts)} vs {preds_cat.numel()}"
+        )
+
+    squared_errors = (preds_cat - labels_cat).pow(2)
+    n_test = squared_errors.numel()
+    sample_idxs = list(range(n_test))
+
     explanations = []
-    for idx_ds in sample_idxs:
-        row = test_ds[idx_ds]
-        raw_text = row["text"]
+    for idx_ds in tqdm(sample_idxs, desc="Building explanations"):
+        raw_text = eval_texts[idx_ds]
+        label_eval = float(labels_cat[idx_ds].item())
+        pred_eval = float(preds_cat[idx_ds].item())
+        mse_eval = float(squared_errors[idx_ds].item())
         prompts = prepare_prompts([raw_text], dataset_name=args.dataset)
-        labels = torch.tensor(
-            [float(row.get("labels", row.get("score", 0.0)))]
-        ).to(device)
         Hq = llama.encode(
             prompts, max_length=args.max_length, already_prompted=True
         ).float()
         Qq = QueryComp(Wq(Hq))
-        z_hat, attn = Inference(Qq, base_mem_flat)
-        if standardize:
-            y_hat = z_hat.squeeze(-1) * y_std + y_mean
-        else:
-            y_hat = z_hat.squeeze(-1)
-        attn_slots = (
-            attn.view(1, 1, idx.numel(), m + 1)
-            .sum(dim=-1)
-            .squeeze(0)
-            .squeeze(0)
+        Mem_flat = base_mem_flat.expand(Qq.size(0), -1, -1)
+        _, r_final, _, contrib_layers = Inference.forward_with_r_mem_contrib(
+            Qq, Mem_flat
         )
-        sorted_vals, sorted_slots = torch.sort(attn_slots, descending=True)
+
+        # Local output-direction for first-order faithful scalar attribution.
+        with torch.enable_grad():
+            r_local = r_final.detach().requires_grad_(True)
+            raw_local = Inference.out(r_local[:, 0, :]).squeeze(-1)
+            if standardize:
+                raw_local = raw_local * y_std + y_mean
+            grad_r = torch.autograd.grad(raw_local.sum(), r_local)[0][
+                :, 0, :
+            ].detach()
+
+        contrib_scores = contribution_importance_to_prototypes(
+            contrib_layers,
+            grad_r,
+            idx.numel(),
+            m + 1,
+            batch_size=Qq.size(0),
+        )
+        contrib_slots = contrib_scores[0]
+        eps = 1e-8
+        total_abs = contrib_slots.abs().sum() + eps
+        total_negative = contrib_slots[contrib_slots < 0].sum()
+        total_positive = contrib_slots[contrib_slots > 0].sum()
+        total_signed = total_negative + total_positive
+
+        pct_abs_total = 100.0 * contrib_slots / total_abs
+        pct_rel_pos_neg = torch.zeros_like(contrib_slots)
+        pos_mask = contrib_slots > 0
+        neg_mask = contrib_slots < 0
+        if total_positive.abs().item() > 0:
+            pct_rel_pos_neg[pos_mask] = (
+                100.0 * contrib_slots[pos_mask] / total_positive
+            )
+        if total_negative.abs().item() > 0:
+            pct_rel_pos_neg[neg_mask] = (
+                100.0 * contrib_slots[neg_mask] / total_negative
+            )
+
+        sorted_slots = torch.argsort(pct_abs_total.abs(), descending=True)
         proto_list = []
-        for val, proto_slot in zip(sorted_vals.tolist(), sorted_slots.tolist()):
+        for proto_slot in sorted_slots.tolist():
             data_idx = idx[proto_slot].item()
             proto_list.append(
                 {
                     "data_idx": int(data_idx),
-                    "attn": float(val),
+                    "contrib": float(contrib_slots[proto_slot].item()),
+                    "pct_abs_total_influence": float(
+                        pct_abs_total[proto_slot].item()
+                    ),
+                    "pct_of_pos_or_neg_total": float(
+                        pct_rel_pos_neg[proto_slot].item()
+                    ),
                     "y": float(y_cache[data_idx].item()),
                     "text": text_cache[data_idx],
                 }
@@ -229,8 +329,12 @@ def main():
             {
                 "test_index": int(idx_ds),
                 "input_text": raw_text,
-                "label": float(labels.cpu().item()),
-                "prediction": float(y_hat.item()),
+                "label": label_eval,
+                "prediction": pred_eval,
+                "mse": mse_eval,
+                "total_negative_contrib": float(total_negative.item()),
+                "total_positive_contrib": float(total_positive.item()),
+                "total_signed_contrib": float(total_signed.item()),
                 "prototypes": proto_list,
             }
         )

@@ -86,15 +86,92 @@ class InferenceLayer(nn.Module):
         )
         self.ln3 = nn.LayerNorm(d_h)
 
-    def forward(self, R, Qq, Mem):
+    def forward(self, R, Qq, Mem, return_q_mem_attn: bool = False):
         R2, _ = self.attn_q(R, Qq, Qq, need_weights=False)
         R = self.ln1(R + R2)
 
-        R2, attn = self.attn_m(R, Mem, Mem, need_weights=True)
+        R2, attn_r_mem = self.attn_m(
+            R,
+            Mem,
+            Mem,
+            need_weights=True,
+            average_attn_weights=False,
+        )
         R = self.ln2(R + R2)
 
         R = self.ln3(R + self.ff(R))
-        return R, attn
+        if return_q_mem_attn:
+            # Query-conditioned retrieval attention for explanations.
+            _, attn_q_mem = self.attn_m(
+                Qq,
+                Mem,
+                Mem,
+                need_weights=True,
+                average_attn_weights=False,
+            )
+            return R, attn_r_mem, attn_q_mem
+        return R, attn_r_mem
+
+    def attn_m_with_token_contrib(self, R, Mem):
+        """
+        Compute R->Mem cross-attention and per-memory-token contribution vectors
+        using the exact attn_m weights (no approximation).
+        Returns:
+          attn: [B, H, Tq, N]
+          attn_out: [B, Tq, E]
+          contrib_out: [B, Tq, N, E]
+        """
+        mha = self.attn_m
+        B, Tq, E = R.shape
+        N = Mem.size(1)
+        H = mha.num_heads
+        Dh = E // H
+        if Dh * H != E:
+            raise ValueError(f"d_h={E} not divisible by num_heads={H}")
+        if mha.bias_k is not None or mha.bias_v is not None or mha.add_zero_attn:
+            raise ValueError("Unsupported MHA config for token contributions.")
+
+        W = mha.in_proj_weight
+        b = mha.in_proj_bias
+        bq = b[:E] if b is not None else None
+        bk = b[E : 2 * E] if b is not None else None
+        bv = b[2 * E :] if b is not None else None
+
+        q_proj = F.linear(R, W[:E, :], bq)
+        k_proj = F.linear(Mem, W[E : 2 * E, :], bk)
+        v_proj = F.linear(Mem, W[2 * E :, :], bv)
+
+        q = q_proj.view(B, Tq, H, Dh).transpose(1, 2)  # [B,H,Tq,Dh]
+        k = k_proj.view(B, N, H, Dh).transpose(1, 2)  # [B,H,N,Dh]
+        v = v_proj.view(B, N, H, Dh).transpose(1, 2)  # [B,H,N,Dh]
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (Dh ** -0.5)  # [B,H,Tq,N]
+        attn = torch.softmax(scores, dim=-1)
+
+        # Per-token head contribution before output projection.
+        contrib_head = attn.unsqueeze(-1) * v.unsqueeze(2)  # [B,H,Tq,N,Dh]
+
+        # Merge heads into model dim E per token contribution.
+        contrib_E = contrib_head.permute(0, 2, 3, 1, 4).contiguous()
+        contrib_E = contrib_E.view(B, Tq, N, E)  # [B,Tq,N,E]
+
+        # Apply the exact out_proj used by MultiheadAttention.
+        contrib_out = F.linear(contrib_E, mha.out_proj.weight, mha.out_proj.bias)
+        attn_out = contrib_out.sum(dim=2)  # [B,Tq,E]
+        return attn, attn_out, contrib_out
+
+    def forward_with_r_mem_contrib(self, R, Qq, Mem):
+        """
+        Faithful forward pass that additionally returns per-memory-token
+        contribution vectors for the R->Mem branch.
+        """
+        R2, _ = self.attn_q(R, Qq, Qq, need_weights=False)
+        R = self.ln1(R + R2)
+
+        attn_r_mem, R2, contrib_r_mem = self.attn_m_with_token_contrib(R, Mem)
+        R = self.ln2(R + R2)
+        R = self.ln3(R + self.ff(R))
+        return R, attn_r_mem, contrib_r_mem
 
 
 class InferenceHead(nn.Module):
@@ -110,14 +187,54 @@ class InferenceHead(nn.Module):
             nn.Linear(d_h, 1),
         )
 
-    def forward(self, Qq, Mem):
+    def forward(
+        self,
+        Qq,
+        Mem,
+        return_q_mem_attn: bool = False,
+        return_r_mem_attn_all: bool = False,
+    ):
         B = Qq.size(0)
         R = self.R0.unsqueeze(0).expand(B, 1, -1)
         attn_last = None
+        attn_r_mem_all = [] if return_r_mem_attn_all else None
+        attn_q_mem_all = [] if return_q_mem_attn else None
         for layer in self.layers:
-            R, attn_last = layer(R, Qq, Mem)
+            if return_q_mem_attn:
+                R, attn_r_mem, attn_q_mem = layer(
+                    R, Qq, Mem, return_q_mem_attn=True
+                )
+                attn_q_mem_all.append(attn_q_mem)
+            else:
+                R, attn_r_mem = layer(R, Qq, Mem)
+            if return_r_mem_attn_all:
+                attn_r_mem_all.append(attn_r_mem)
+            attn_last = attn_r_mem
         raw = self.out(R[:, 0, :])
+        if return_q_mem_attn:
+            return raw, attn_q_mem_all
+        if return_r_mem_attn_all:
+            return raw, attn_r_mem_all
         return raw, attn_last
+
+    def forward_with_r_mem_contrib(self, Qq, Mem):
+        """
+        Faithful explanation forward:
+        returns prediction, final readout state, per-layer R->Mem attention,
+        and per-layer per-token contribution vectors.
+        """
+        B = Qq.size(0)
+        R = self.R0.unsqueeze(0).expand(B, 1, -1)
+        attn_r_all = []
+        contrib_r_all = []
+        for layer in self.layers:
+            R, attn_r_mem, contrib_r_mem = layer.forward_with_r_mem_contrib(
+                R, Qq, Mem
+            )
+            attn_r_all.append(attn_r_mem)
+            contrib_r_all.append(contrib_r_mem)
+        raw = self.out(R[:, 0, :])
+        return raw, R, attn_r_all, contrib_r_all
 
 
 class SlotSelector(nn.Module):
